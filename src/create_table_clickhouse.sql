@@ -94,3 +94,30 @@ ORDER BY (dataset, session_id, client_id, ts_vrsrequest_us, ts_vrsresponse_us, e
 SETTINGS
     index_granularity = 2048,
     index_granularity_bytes = 0;
+
+-- calls (batch_calls)
+DROP TABLE IF EXISTS tracelog.calls;
+
+CREATE TABLE tracelog.calls
+(
+    dataset                 LowCardinality(String),
+
+    session_id              UInt64,
+    client_id               UInt64,
+    connect_id              UInt64,
+
+    ts_vrsrequest_us        DateTime64(6, 'UTC'),
+    ts_vrsresponse_us       DateTime64(6, 'UTC'),
+
+    event_name              LowCardinality(String),
+    duration_us             UInt64,
+    cpu_time                UInt64,
+    memory                  Int64,
+    memory_peak             UInt64
+)
+ENGINE = MergeTree
+PARTITION BY (dataset)
+ORDER BY (dataset, session_id, client_id, ts_vrsrequest_us, ts_vrsresponse_us)
+SETTINGS
+    index_granularity = 2048,
+    index_granularity_bytes = 0;

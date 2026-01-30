@@ -64,6 +64,7 @@ SESSION = requests.Session()
 TABLE_OPERATIONS = "operations"
 TABLE_EVENTS = "events"
 TABLE_EVENT_STATS = "event_stats"
+TABLE_CALL_OPS = "calls"
 
 # --- Компиляция регулярных выражений ---
 EVENT_START_RE = re.compile(r"^(\d{2}):(\d{2})\.(\d{6})-(\d+),([A-Za-z]+),")
@@ -176,6 +177,11 @@ def to_int_safe(value: str | int | None, default: int = 0) -> int:
     except (ValueError, TypeError):
         return default
 
+def extract_metric_value(event_text: str, key: str) -> int:
+    """Извлекает числовое значение метрики вида Key=123 из строки события."""
+    match = re.search(rf"\b{re.escape(key)}=([^,\r\n]+)", event_text)
+    return to_int_safe(match.group(1) if match else None)
+
 
 # ============================================================
 # =  CLICKHOUSE UTILITIES
@@ -222,7 +228,7 @@ def insert_batch(table: str, rows: list[dict]) -> None:
 
 # <<< быстрая очистка текущего набора данных
 def clear_dataset(dataset: str) -> None:
-    for table in (TABLE_EVENTS, TABLE_OPERATIONS, TABLE_EVENT_STATS):
+    for table in (TABLE_EVENTS, TABLE_OPERATIONS, TABLE_EVENT_STATS, TABLE_CALL_OPS):
         q = f"ALTER TABLE {CLICKHOUSE_DATABASE}.{table} DELETE WHERE dataset = '{dataset}'"
         try:
             resp = SESSION.post(
@@ -521,7 +527,8 @@ def process_logs(input_dir: str) -> None:
     logger.info(f"Часовых групп: {len(by_hour)}")
 
     active_ops: Dict[str, Dict] = {}
-    batch_ops, batch_events, batch_event_stats = [], [], []
+    pending_ops: Dict[str, Dict] = {}
+    batch_ops, batch_events, batch_event_stats, batch_calls = [], [], [], []
     total_operations = 0
 
     def handle_event(event_meta: dict, event_text: str, ts_event: datetime):
@@ -569,6 +576,15 @@ def process_logs(input_dir: str) -> None:
                     "context": extract_first_field(op["events"], "Context"),
                 })
 
+                if event_name == "VRSRESPONSE" and op_key:
+                    pending_ops[op_key] = {
+                        "session_id": to_int_safe(op.get("session")),
+                        "connect_id": to_int_safe(op.get("connect")),
+                        "client_id": to_int_safe(op.get("client")) or to_int_safe(op_key),
+                        "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
+                        "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
+                    }
+
                 prev_ts = None
                 for ev_data in op["events"]:
                     ts = ev_data["ts"]
@@ -596,14 +612,14 @@ def process_logs(input_dir: str) -> None:
                     batch_events.append(row)
 
                 event_stats = calculate_event_stats(op)
-                for event_name, stats in event_stats.items():
+                for stats_event_name, stats in event_stats.items():
                     batch_event_stats.append({
                         "session_id": to_int_safe(op.get("session")),
                         "connect_id": to_int_safe(op.get("connect")),
                         "client_id": to_int_safe(op.get("client")),
                         "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
                         "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
-                        "event_name": event_name,
+                        "event_name": stats_event_name,
                         "total_duration_us": stats["total_duration_us"],
                         "count": stats["count"],
                         "percentage": stats["percentage"],
@@ -632,11 +648,48 @@ def process_logs(input_dir: str) -> None:
         connect_id = props.get("t:connectID")
                   
         if event_name == "VRSREQUEST":
+            if client_id in pending_ops:
+                del pending_ops[client_id]
             start_operation(client_id, session_id, connect_id)
 
         elif event_name == "VRSRESPONSE":
             if client_id in active_ops:
                 complete_operation(client_id)
+
+        elif event_name == "CALL":
+            pending = pending_ops.get(client_id)
+            if pending:
+                session_id_val = to_int_safe(props.get("SessionID"))
+                if session_id_val == 0:
+                    session_id_val = to_int_safe(pending.get("session_id"))
+                batch_calls.append({
+                    "event_name": event_name,
+                    "duration_us": to_int_safe(event_meta.get("duration")),
+                    "session_id": session_id_val,
+                    "client_id": to_int_safe(props.get("t:clientID")),
+                    "cpu_time": extract_metric_value(event_text, "CpuTime"),
+                    "memory": extract_metric_value(event_text, "Memory"),
+                    "memory_peak": extract_metric_value(event_text, "MemoryPeak"),
+                    "connect_id": to_int_safe(pending.get("connect_id")),
+                    "ts_vrsrequest_us": pending.get("ts_vrsrequest_us"),
+                    "ts_vrsresponse_us": pending.get("ts_vrsresponse_us"),
+                })
+                batch_events.append({
+                    "session_id": session_id_val,
+                    "connect_id": to_int_safe(pending.get("connect_id")),
+                    "client_id": to_int_safe(props.get("t:clientID")),
+                    "user": props.get("Usr"),
+                    "ts_vrsrequest_us": pending.get("ts_vrsrequest_us"),
+                    "ts_vrsresponse_us": pending.get("ts_vrsresponse_us"),
+                    "ts_event_us": ts_event.isoformat(timespec="microseconds"),
+                    "ts_event": ts_event.replace(microsecond=0).isoformat(),
+                    "event_name": event_name,
+                    "duration_us": to_int_safe(event_meta.get("duration")),
+                    "space_us": 0,
+                    "event_string": event_text,
+                    "context": props.get("Context"),
+                })
+                del pending_ops[client_id]
 
         elif event_name == "SESN":
            
@@ -664,9 +717,11 @@ def process_logs(input_dir: str) -> None:
             insert_batch(TABLE_OPERATIONS, batch_ops)
             insert_batch(TABLE_EVENTS, batch_events)
             insert_batch(TABLE_EVENT_STATS, batch_event_stats)
+            insert_batch(TABLE_CALL_OPS, batch_calls)
             batch_events.clear()
             batch_ops.clear()
             batch_event_stats.clear()
+            batch_calls.clear()
 
     total_hours = len(by_hour)
     for hour_idx, (hour_key, hour_files) in enumerate(sorted(by_hour.items()), start=1):
@@ -699,10 +754,11 @@ def process_logs(input_dir: str) -> None:
                 pbar.update(lines_since_update)
                 pbar.set_postfix({"Операции": total_operations})
 
-    if batch_events or batch_ops or batch_event_stats:
+    if batch_events or batch_ops or batch_event_stats or batch_calls:
         insert_batch(TABLE_EVENTS, batch_events)
         insert_batch(TABLE_OPERATIONS, batch_ops)
         insert_batch(TABLE_EVENT_STATS, batch_event_stats)
+        insert_batch(TABLE_CALL_OPS, batch_calls)
         logger.info(f"Отправлена финальная пачка: {len(batch_events)} событий, {len(batch_ops)} операций")
 
     completion_msg = f"Готово: обработано {total_operations} операций"
