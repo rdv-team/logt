@@ -7,6 +7,7 @@ CREATE TABLE tracelog.operations
 (
     -- Ключи фильтрации
     dataset               LowCardinality(String),
+    db_name               LowCardinality(String),
 
     session_id            UInt64,
     client_id             UInt64,
@@ -31,7 +32,7 @@ CREATE TABLE tracelog.operations
 )
 ENGINE = MergeTree
 PARTITION BY (dataset)
-ORDER BY (dataset, ts_vrsresponse, session_id, client_id, ts_vrsresponse_us)
+ORDER BY (dataset, db_name, ts_vrsresponse, session_id, client_id, ts_vrsresponse_us)
 SETTINGS index_granularity = 8192;
 
 -- events
@@ -40,6 +41,7 @@ DROP TABLE IF EXISTS tracelog.events;
 CREATE TABLE tracelog.events
 (
     dataset                 LowCardinality(String),
+    db_name                 LowCardinality(String),
 
     session_id              UInt64,
     client_id               UInt64,
@@ -62,7 +64,7 @@ CREATE TABLE tracelog.events
 )
 ENGINE = MergeTree
 PARTITION BY (dataset)
-ORDER BY (dataset, session_id, client_id, ts_vrsrequest_us, ts_vrsresponse_us, ts_event_us)
+ORDER BY (dataset, db_name, session_id, client_id, ts_vrsrequest_us, ts_vrsresponse_us, ts_event_us)
 SETTINGS
     index_granularity = 2048,
     index_granularity_bytes = 0;
@@ -73,6 +75,7 @@ DROP TABLE IF EXISTS tracelog.event_stats;
 CREATE TABLE tracelog.event_stats
 (
     dataset                 LowCardinality(String),
+    db_name                 LowCardinality(String),
 
     session_id              UInt64,
     client_id               UInt64,
@@ -90,7 +93,7 @@ CREATE TABLE tracelog.event_stats
 )
 ENGINE = MergeTree
 PARTITION BY (dataset)
-ORDER BY (dataset, session_id, client_id, ts_vrsrequest_us, ts_vrsresponse_us, event_name)
+ORDER BY (dataset, db_name, session_id, client_id, ts_vrsrequest_us, ts_vrsresponse_us, event_name)
 SETTINGS
     index_granularity = 2048,
     index_granularity_bytes = 0;
@@ -101,6 +104,7 @@ DROP TABLE IF EXISTS tracelog.calls;
 CREATE TABLE tracelog.calls
 (
     dataset                 LowCardinality(String),
+    db_name                 LowCardinality(String),
 
     session_id              UInt64,
     client_id               UInt64,
@@ -117,7 +121,7 @@ CREATE TABLE tracelog.calls
 )
 ENGINE = MergeTree
 PARTITION BY (dataset)
-ORDER BY (dataset, session_id, client_id, ts_vrsrequest_us, ts_vrsresponse_us)
+ORDER BY (dataset, db_name, session_id, client_id, ts_vrsrequest_us, ts_vrsresponse_us)
 SETTINGS
     index_granularity = 2048,
     index_granularity_bytes = 0;

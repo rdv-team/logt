@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # =  CONFIG & LOGGING
 # ============================================================
 from __future__ import annotations
@@ -12,9 +12,18 @@ import shutil
 import heapq
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 from datetime import datetime
 from tqdm import tqdm
+
+try:
+    import orjson
+except ImportError:  # pragma: no cover - ускорение сериализации опционально
+    orjson = None
+
+JSON_SERIALIZER_NAME = "orjson" if orjson is not None else "json"
+
+OpKey = tuple[int, int, str, str]
 
 # --- Загрузка конфигурации ---
 def load_config():
@@ -29,6 +38,8 @@ LOG_DIR = Path(config["paths"]["log_dir"])
 LOG_DIR.mkdir(exist_ok=True)
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = LOG_DIR / f"trace-vrs-{timestamp}.log"
+replaced_ops_dir = LOG_DIR / f"replaced-active-ops-{timestamp}"
+replaced_ops_dir.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,10 +62,34 @@ TIMEOUT = config["processing"]["timeout"]
 DATASET_NAME = config["processing"]["dataset_name"]
 PROCESS_CLIENT_SERVER_OPS = config["processing"]["client_server_operations"]
 PROCESS_BACKGROUND_JOBS = config["processing"]["background_jobs"]
+COUNT_LINES_FOR_PROGRESS = config["processing"].get("count_lines_for_progress", True)
+INSERT_COMPRESSION = str(config["processing"].get("insert_compression", "gzip")).strip().lower()
+if INSERT_COMPRESSION not in {"gzip", "none"}:
+    INSERT_COMPRESSION = "gzip"
+try:
+    GZIP_LEVEL = int(config["processing"].get("gzip_level", 1))
+except (TypeError, ValueError):
+    GZIP_LEVEL = 1
+if GZIP_LEVEL < 1 or GZIP_LEVEL > 9:
+    GZIP_LEVEL = 1
 
 # --- Ограничения фильтрации операций ---
 MIN_OPERATION_DURATION_MS = config["filtering"]["min_operation_duration_ms"]
 MIN_OPERATION_EVENTS = config["filtering"]["min_operation_events"]
+try:
+    CALL_EXPECTED_WINDOW_SECONDS = int(config["filtering"].get("call_expected_window_seconds", 1))
+except (TypeError, ValueError):
+    CALL_EXPECTED_WINDOW_SECONDS = 10
+if CALL_EXPECTED_WINDOW_SECONDS < 0:
+    CALL_EXPECTED_WINDOW_SECONDS = 10
+try:
+    CALL_BIND_TTL_SECONDS = int(config["filtering"].get("call_bind_ttl_seconds", 3600))
+except (TypeError, ValueError):
+    CALL_BIND_TTL_SECONDS = 3600
+if CALL_BIND_TTL_SECONDS < 1:
+    CALL_BIND_TTL_SECONDS = 3600
+if CALL_BIND_TTL_SECONDS < CALL_EXPECTED_WINDOW_SECONDS:
+    CALL_BIND_TTL_SECONDS = CALL_EXPECTED_WINDOW_SECONDS
 
 
 # Reuse HTTP connection
@@ -68,8 +103,13 @@ TABLE_CALL_OPS = "calls"
 
 # --- Компиляция регулярных выражений ---
 EVENT_START_RE = re.compile(r"^(\d{2}):(\d{2})\.(\d{6})-(\d+),([A-Za-z]+),")
-PROPS_PATTERN = re.compile(r"\b(t:clientID|SessionID|Usr|t:connectID|Appl|Func|Nmb)=([^,\r\n]+)")
 CONTEXT_PATTERN = re.compile(r',Context=(?:"([^"]*)"|\'([^\']*)\'|([^,\r\n]+))', re.DOTALL)
+SESSION_ID_RE = re.compile(r"^\s*(\d+)(?:\(\d+\))?\s*$")
+PROP_KEYS = ("t:clientID", "SessionID", "Usr", "t:connectID", "Appl", "Func", "Nmb", "IB", "p:processName")
+PROP_KEY_TOKENS = {key: f"{key}=" for key in PROP_KEYS}
+ROUTE_KEYS_DEFAULT = frozenset({"t:clientID", "SessionID", "t:connectID", "p:processName"})
+ROUTE_KEYS_SESN = frozenset({"Nmb", "Func", "Appl", "t:connectID", "IB", "SessionID"})
+PERSIST_KEYS = frozenset({"Usr"})
 
 
 # ============================================================
@@ -88,7 +128,7 @@ def get_file_line_count(file_path: str) -> int:
             while buf:
                 lines += buf.count(b'\n')
                 buf = read_f(buf_size)
-            
+
             return lines
     except Exception:
         return 0
@@ -104,28 +144,141 @@ def parse_event_start(line: str) -> dict | None:
         }
     return None
 
-def extract_props(event: str) -> dict:
-    props = {}
-    
-    # Первый паттерн
-    for match in PROPS_PATTERN.finditer(event):
-        key, val = match.groups()
-        props[key] = val.strip().strip("'\"")
-    
-    # Второй паттерн - Context (аналогично оригинальной extract_context)
+def save_replaced_active_op_log(op_key: OpKey, op: dict, replaced_by: dict | None = None) -> None:
+    saved_at = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out_file = replaced_ops_dir / f"replaced-op-db{op_key[0]}-id{op_key[1]}-{saved_at}.log"
+    events = op.get("events", [])
+
+    def fmt_ts(value: object) -> str:
+        if isinstance(value, datetime):
+            return value.isoformat(timespec="microseconds")
+        return str(value) if value is not None else ""
+
+    first_event_name = ""
+    if events:
+        first_event_name = events[0].get("meta", {}).get("event_name", "")
+
+    replacer_event_name = (replaced_by or {}).get("event_name", "")
+    replacer_ts = fmt_ts((replaced_by or {}).get("ts"))
+    replacer_source = (replaced_by or {}).get("source_file", "")
+    replacer_connect = (replaced_by or {}).get("connect_id", "")
+
+    try:
+        with open(out_file, "w", encoding="utf-8-sig") as f:
+            f.write("# Replaced active operation diagnostic\n")
+            f.write(f"# victim_op_key={op_key}\n")
+            f.write(f"# victim_start_event={first_event_name}\n")
+            f.write(f"# victim_start_ts={fmt_ts(op.get('ts_vrsrequest'))}\n")
+            f.write(f"# victim_connect_id={op.get('connect') or ''}\n")
+            f.write(f"# replacer_event={replacer_event_name}\n")
+            f.write(f"# replacer_ts={replacer_ts}\n")
+            f.write(f"# replacer_source_file={replacer_source}\n")
+            f.write(f"# replacer_connect_id={replacer_connect}\n")
+            f.write("# --- original events ---\n")
+            for ev in events:
+                text = ev.get("text")
+                if not text:
+                    continue
+                f.write(text)
+                if not text.endswith("\n"):
+                    f.write("\n")
+
+        logger.warning(
+            "Saved interrupted operation %s: %s events -> %s; replaced_by(event=%s, ts=%s, source=%s, connect=%s)",
+            op_key,
+            len(events),
+            out_file,
+            replacer_event_name or "unknown",
+            replacer_ts or "unknown",
+            replacer_source or "unknown",
+            replacer_connect or "unknown",
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить незакрытую операцию {op_key}: {e}")
+
+def _find_prop_value(event: str, key: str) -> str | None:
+    token = PROP_KEY_TOKENS.get(key)
+    if not token:
+        return None
+
+    start = 0
+    while True:
+        idx = event.find(token, start)
+        if idx == -1:
+            return None
+        # Избегаем ложных срабатываний внутри более длинных идентификаторов.
+        if idx > 0:
+            prev_ch = event[idx - 1]
+            if prev_ch.isalnum() or prev_ch in "_":
+                start = idx + 1
+                continue
+
+        val_start = idx + len(token)
+        val_end = val_start
+        event_len = len(event)
+        while val_end < event_len and event[val_end] not in ",\r\n":
+            val_end += 1
+        value = event[val_start:val_end].strip().strip("'\"")
+        return value or None
+
+
+def _extract_context(event: str) -> str | None:
+    if "Context=" not in event:
+        return None
     if match := CONTEXT_PATTERN.search(event):
         for val in match.groups():
             if val:
-                props['Context'] = val.strip()
-                break 
+                cleaned = val.strip()
+                return cleaned or None
+    return None
+
+
+def extract_props(
+    event: str,
+    needed_keys: set[str] | tuple[str, ...] | None = None,
+    include_context: bool = True,
+    base_props: dict | None = None,
+) -> dict:
+    props = dict(base_props) if base_props else {}
+    keys = needed_keys if needed_keys is not None else PROP_KEYS
+
+    for key in keys:
+        if key in props:
+            continue
+        value = _find_prop_value(event, key)
+        if value is not None:
+            props[key] = value
+
+    if include_context and "Context" not in props:
+        context_val = _extract_context(event)
+        if context_val is not None:
+            props["Context"] = context_val
 
     return props
+
+def resolve_db_name(event_name: str, props: dict) -> str | None:
+    if event_name == "SESN":
+        return props.get("IB")
+    return props.get("p:processName")
+
+def normalize_db_name(db_name: str | None) -> str | None:
+    if not db_name:
+        return None
+    return db_name.strip().casefold()
+
+def normalize_session_id(session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    if session_id.isdigit():
+        return session_id
+    match = SESSION_ID_RE.match(session_id)
+    return match.group(1) if match else None
 
 def update_op_props(op: dict, props: dict) -> None:
     """Обновляет session в active_ops, если они ещё не заданы."""
     if not op.get("session"):
-        session_id = props.get("SessionID")
-        if session_id and session_id.isdigit():
+        session_id = normalize_session_id(props.get("SessionID"))
+        if session_id:
             op["session"] = session_id
 
     if not op.get("connect"):
@@ -183,6 +336,12 @@ def extract_metric_value(event_text: str, key: str) -> int:
     return to_int_safe(match.group(1) if match else None)
 
 
+def encode_json_row(row: dict) -> bytes:
+    if orjson is not None:
+        return orjson.dumps(row)
+    return json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 # ============================================================
 # =  CLICKHOUSE UTILITIES
 # ============================================================
@@ -191,16 +350,22 @@ def insert_batch(table: str, rows: list[dict]) -> None:
     if not rows:
         return
 
-    # <<< добавляем dataset в каждую строку перед сериализацией
-    for r in rows:
-        r["dataset"] = DATASET_NAME
+    rows_count = len(rows)
+    body_sql = (
+        f"INSERT INTO {CLICKHOUSE_DATABASE}.{table} FORMAT JSONEachRow\n".encode("utf-8")
+        + b"\n".join(encode_json_row(r) for r in rows)
+    )
 
-    body_sql = "INSERT INTO {} FORMAT JSONEachRow\n{}".format(
-        f"{CLICKHOUSE_DATABASE}.{table}",   # <<< пишем с префиксом БД
-        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows)
-    ).encode("utf-8")
-    gz = gzip.compress(body_sql)
+    request_data = body_sql
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Accept": "text/plain",
+    }
+    if INSERT_COMPRESSION == "gzip":
+        request_data = gzip.compress(body_sql, compresslevel=GZIP_LEVEL)
+        headers["Content-Encoding"] = "gzip"
 
+    ok = False
     try:
         resp = SESSION.post(
             f"{CLICKHOUSE_URL}/",
@@ -211,20 +376,16 @@ def insert_batch(table: str, rows: list[dict]) -> None:
                 "input_format_parallel_parsing": 0,
                 "enable_http_compression": 1
             },
-            data=gz,
-            headers={
-                "Content-Type": "text/plain; charset=utf-8",
-                "Content-Encoding": "gzip",
-                "Accept": "text/plain",
-                # keep-alive по умолчанию
-            },
+            data=request_data,
+            headers=headers,
             timeout=(5, TIMEOUT),
             proxies={}
         )
+        ok = resp.status_code == 200
         if resp.status_code != 200:
-            print(f"[ERROR] Insert into {table} failed: HTTP {resp.status_code}. Body: {resp.text[:800]} (rows={len(rows)})")
+            print(f"[ERROR] Insert into {table} failed: HTTP {resp.status_code}. Body: {resp.text[:800]} (rows={rows_count})")
     except requests.RequestException as e:
-        print(f"[ERROR] Insert failed into {table}: {e} (rows={len(rows)})")
+        print(f"[ERROR] Insert failed into {table}: {e} (rows={rows_count})")
 
 # <<< быстрая очистка текущего набора данных
 def clear_dataset(dataset: str) -> None:
@@ -346,6 +507,14 @@ def group_files_by_hour(files: list[str]) -> dict[str, list[str]]:
 def is_rmngr_path(path: str) -> bool:
     """Возвращает True, если путь относится к каталогу rmngr_*."""
     return any(part.startswith("rmngr_") for part in Path(path).parts)
+
+def get_process_id(path: str) -> str:
+    """Возвращает идентификатор процесса (rphost_*/rmngr_*) для изоляции ключей операций."""
+    p = Path(path)
+    for part in reversed(p.parts):
+        if part.startswith("rphost_") or part.startswith("rmngr_"):
+            return part
+    return p.parent.name or p.name
 
 def iter_events(file_path: str):
     """
@@ -478,28 +647,38 @@ def build_temp_for_multi(input_dir: str, temp_dir: str) -> None:
     all_groups.update(rphost_groups)
     all_groups.update(rmngr_groups)
 
-    print(f"[INFO] Найдено процессов: {len(all_groups)} - {', '.join(sorted(all_groups.keys()))}")
+    sorted_groups = sorted(all_groups.items())
+    total_processes = len(sorted_groups)
+    print(f"[INFO] Найдено процессов: {total_processes} - {', '.join(name for name, _ in sorted_groups)}")
 
-    for proc_name, proc_dirs in sorted(all_groups.items()):
-        print(f"[INFO] Процесс {proc_name}: каталогов {len(proc_dirs)}")
+    for proc_idx, (proc_name, proc_dirs) in enumerate(sorted_groups, start=1):
         # соберем все .log этого процесса из всех типовых каталогов
         all_logs: list[str] = []
         for d in proc_dirs:
             all_logs.extend(sorted(glob.glob(str(Path(d) / "*.log"))))
 
         if not all_logs:
-            print(f"[WARN] У процесса {proc_name} нет логов - пропускаю")
+            print(f"[WARN] Процесс {proc_idx}/{total_processes} {proc_name}: каталогов {len(proc_dirs)}, файлов 0 - пропускаю")
             continue
+        total_logs = len(all_logs)
+        print(f"[INFO] Процесс {proc_idx}/{total_processes} {proc_name}: каталогов {len(proc_dirs)}, файлов {total_logs}")
 
         # сгруппируем по часу
         by_hour = group_files_by_hour(all_logs)
         out_proc_dir = temp_root / proc_name
         out_proc_dir.mkdir(parents=True, exist_ok=True)
+        total_hours = len(by_hour)
+        processed_logs = 0
 
-        for hour_key, hour_files in sorted(by_hour.items()):
+        for hour_idx, (hour_key, hour_files) in enumerate(sorted(by_hour.items()), start=1):
             out_file = out_proc_dir / f"{hour_key}.log"   # без суффиксов
             cnt = merge_hour_events(hour_files, out_file)
-            print(f"[INFO]   {proc_name}/{out_file.name}: объединено {cnt:,} событий из {len(hour_files)} файлов")
+            processed_logs += len(hour_files)
+            print(
+                f"[INFO] {proc_name}/{out_file.name}: "
+                f"объединено {cnt:,} событий из {len(hour_files)} файлов "
+                f"(обработано файлов {processed_logs}/{total_logs})"
+            )
 
     print(f"[INFO] Временная структура собрана: {temp_root}")
 
@@ -526,12 +705,52 @@ def process_logs(input_dir: str) -> None:
     print(f"[INFO] Часовых групп: {len(by_hour)}")
     logger.info(f"Часовых групп: {len(by_hour)}")
 
-    active_ops: Dict[str, Dict] = {}
-    pending_ops: Dict[str, Dict] = {}
+    active_ops: Dict[OpKey, Dict] = {}
+    pending_call: Dict[OpKey, Dict] = {}
+    early_call: Dict[OpKey, Dict] = {}
+    process_id_cache: dict[str, str] = {}
     batch_ops, batch_events, batch_event_stats, batch_calls = [], [], [], []
     total_operations = 0
+    db_ids: Dict[str, int] = {}
+    next_db_id = 1
 
-    def handle_event(event_meta: dict, event_text: str, ts_event: datetime):
+    def flush_batches() -> tuple[int, int, int, int]:
+        counts = (len(batch_events), len(batch_ops), len(batch_event_stats), len(batch_calls))
+        if not any(counts):
+            return counts
+
+
+        insert_batch(TABLE_OPERATIONS, batch_ops)
+        insert_batch(TABLE_EVENTS, batch_events)
+        insert_batch(TABLE_EVENT_STATS, batch_event_stats)
+        insert_batch(TABLE_CALL_OPS, batch_calls)
+
+        batch_events.clear()
+        batch_ops.clear()
+        batch_event_stats.clear()
+        batch_calls.clear()
+        return counts
+
+    def get_db_id(db_name: str | None) -> int:
+        nonlocal next_db_id
+        if not db_name:
+            return 0
+        db_id = db_ids.get(db_name)
+        if db_id is None:
+            db_id = next_db_id
+            db_ids[db_name] = db_id
+            next_db_id += 1
+        return db_id
+
+    def build_op_key(db_name: str | None, op_id: str | None, process_id: str, op_kind: str) -> OpKey | None:
+        normalized_id = normalize_session_id(op_id)
+        if not normalized_id:
+            return None
+        process_part = "" if op_kind == "sesn" else process_id
+        key = (get_db_id(normalize_db_name(db_name)), int(normalized_id), process_part, op_kind)
+        return key
+
+    def handle_event(event_meta: dict, event_text: str, ts_event: datetime, source_path: str):
         """Обрабатывает одно событие, обновляя активные операции и пачки."""
         event_name = event_meta["event_name"]
         if event_name in ("VRSREQUEST", "VRSRESPONSE") and not PROCESS_CLIENT_SERVER_OPS:
@@ -539,7 +758,86 @@ def process_logs(input_dir: str) -> None:
         if event_name == "SESN" and not PROCESS_BACKGROUND_JOBS:
             return
 
-        def complete_operation(op_key: str) -> None:
+        def append_call_rows(pending: dict, call_meta: dict, call_text: str, call_props: dict, call_ts: datetime) -> None:
+            """Добавляет CALL в batch_calls и batch_events, используя границы операции из pending_call."""
+            session_id_val = to_int_safe(normalize_session_id(call_props.get("SessionID")))
+            if session_id_val == 0:
+                session_id_val = to_int_safe(pending.get("session_id"))
+            client_id_val = to_int_safe(pending.get("client_id"))
+
+            batch_calls.append({
+                "dataset": DATASET_NAME,
+                "db_name": pending.get("db_name") or "",
+                "event_name": call_meta.get("event_name") or "CALL",
+                "duration_us": to_int_safe(call_meta.get("duration")),
+                "session_id": session_id_val,
+                "client_id": client_id_val,
+                "cpu_time": extract_metric_value(call_text, "CpuTime"),
+                "memory": extract_metric_value(call_text, "Memory"),
+                "memory_peak": extract_metric_value(call_text, "MemoryPeak"),
+                "connect_id": to_int_safe(pending.get("connect_id")),
+                "ts_vrsrequest_us": pending.get("ts_vrsrequest_us"),
+                "ts_vrsresponse_us": pending.get("ts_vrsresponse_us"),
+            })
+            batch_events.append({
+                "dataset": DATASET_NAME,
+                "db_name": pending.get("db_name") or "",
+                "session_id": session_id_val,
+                "connect_id": to_int_safe(pending.get("connect_id")),
+                "client_id": client_id_val,
+                "user": call_props.get("Usr"),
+                "ts_vrsrequest_us": pending.get("ts_vrsrequest_us"),
+                "ts_vrsresponse_us": pending.get("ts_vrsresponse_us"),
+                "ts_event_us": call_ts.isoformat(timespec="microseconds"),
+                "ts_event": call_ts.replace(microsecond=0).isoformat(),
+                "event_name": call_meta.get("event_name") or "CALL",
+                "duration_us": to_int_safe(call_meta.get("duration")),
+                "space_us": 0,
+                "event_string": call_text,
+                "context": call_props.get("Context"),
+            })
+
+        def get_valid_pending_for_call(client_key: OpKey | None, sesn_key: OpKey | None, call_ts: datetime) -> tuple[OpKey | None, dict | None]:
+            for candidate_key in (client_key, sesn_key):
+                if not candidate_key:
+                    continue
+                pending = pending_call.get(candidate_key)
+                if not pending:
+                    continue
+
+                response_ts = pending.get("ts_vrsresponse_dt")
+                if not isinstance(response_ts, datetime):
+                    try:
+                        response_ts = datetime.fromisoformat(str(pending.get("ts_vrsresponse_us")))
+                    except Exception:
+                        response_ts = None
+
+                if not isinstance(response_ts, datetime):
+                    pending_call.pop(candidate_key, None)
+                    continue
+
+                gap_sec = abs((call_ts - response_ts).total_seconds())
+                if gap_sec > CALL_BIND_TTL_SECONDS:
+                    pending_call.pop(candidate_key, None)
+                    logger.warning(
+                        "Dropped stale pending CALL bind: key=%s, gap=%.3fs, ttl=%ss",
+                        candidate_key,
+                        gap_sec,
+                        CALL_BIND_TTL_SECONDS,
+                    )
+                    continue
+
+                if gap_sec > CALL_EXPECTED_WINDOW_SECONDS:
+                    logger.warning(
+                        "CALL bind outside expected window: key=%s, gap=%.3fs, expected=%ss",
+                        candidate_key,
+                        gap_sec,
+                        CALL_EXPECTED_WINDOW_SECONDS,
+                    )
+                return candidate_key, pending
+            return None, None
+
+        def complete_operation(op_key: OpKey) -> None:
             """
             Добавляет текущее событие в операцию, ставит ts_vrsresponse, считает длительность,
             применяет фильтры, пушит батчи и убирает запись из active_ops.
@@ -557,13 +855,18 @@ def process_logs(input_dir: str) -> None:
             events_count = len(op["events"])
             min_duration_us = MIN_OPERATION_DURATION_MS * 1000
             if duration_us < min_duration_us or events_count < MIN_OPERATION_EVENTS:
+                early_call.pop(op_key, None)
                 del active_ops[op_key]
                 return
+
+            early_item = early_call.pop(op_key, None)
 
             if op.get("session"):
                 total_operations += 1
 
                 batch_ops.append({
+                    "dataset": DATASET_NAME,
+                    "db_name": op.get("db_name") or "",
                     "session_id": to_int_safe(op.get("session")),
                     "connect_id": to_int_safe(op.get("connect")),
                     "client_id": to_int_safe(op.get("client")),
@@ -576,14 +879,44 @@ def process_logs(input_dir: str) -> None:
                     "context": extract_first_field(op["events"], "Context"),
                 })
 
-                if event_name == "VRSRESPONSE" and op_key:
-                    pending_ops[op_key] = {
+                if event_name in ("VRSRESPONSE", "SESN") and op_key:
+                    pending_call[op_key] = {
+                        "db_name": op.get("db_name") or "",
                         "session_id": to_int_safe(op.get("session")),
                         "connect_id": to_int_safe(op.get("connect")),
-                        "client_id": to_int_safe(op.get("client")) or to_int_safe(op_key),
+                        "client_id": to_int_safe(op.get("client")) or op_key[1],
                         "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
                         "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
+                        "ts_vrsresponse_dt": op["ts_vrsresponse"],
                     }
+                    if early_item:
+                        pending = pending_call[op_key]
+                        early_ts = early_item.get("ts")
+                        if isinstance(early_ts, datetime):
+                            gap_sec = abs((early_ts - op["ts_vrsresponse"]).total_seconds())
+                            if gap_sec <= CALL_BIND_TTL_SECONDS:
+                                if gap_sec > CALL_EXPECTED_WINDOW_SECONDS:
+                                    logger.warning(
+                                        "EARLY CALL bind outside expected window: key=%s, gap=%.3fs, expected=%ss",
+                                        op_key,
+                                        gap_sec,
+                                        CALL_EXPECTED_WINDOW_SECONDS,
+                                    )
+                                append_call_rows(
+                                    pending,
+                                    early_item["meta"],
+                                    early_item["text"],
+                                    early_item["props"],
+                                    early_ts,
+                                )
+                            else:
+                                logger.warning(
+                                    "Dropped stale EARLY CALL bind: key=%s, gap=%.3fs, ttl=%ss",
+                                    op_key,
+                                    gap_sec,
+                                    CALL_BIND_TTL_SECONDS,
+                                )
+                        pending_call.pop(op_key, None)
 
                 prev_ts = None
                 for ev_data in op["events"]:
@@ -595,6 +928,8 @@ def process_logs(input_dir: str) -> None:
                     prev_ts = ts
 
                     row = {
+                        "dataset": DATASET_NAME,
+                        "db_name": op.get("db_name") or "",
                         "session_id": to_int_safe(op.get("session")),
                         "connect_id": to_int_safe(op.get("connect")),
                         "client_id": to_int_safe(op.get("client")),
@@ -614,6 +949,8 @@ def process_logs(input_dir: str) -> None:
                 event_stats = calculate_event_stats(op)
                 for stats_event_name, stats in event_stats.items():
                     batch_event_stats.append({
+                        "dataset": DATASET_NAME,
+                        "db_name": op.get("db_name") or "",
                         "session_id": to_int_safe(op.get("session")),
                         "connect_id": to_int_safe(op.get("connect")),
                         "client_id": to_int_safe(op.get("client")),
@@ -624,17 +961,28 @@ def process_logs(input_dir: str) -> None:
                         "count": stats["count"],
                         "percentage": stats["percentage"],
                     })
-
             del active_ops[op_key]
 
-        def start_operation(op_key: str, session_value: str | None, connect_value: str | None) -> None:
+        def start_operation(op_key: OpKey, session_value: str | None, connect_value: str | None, db_name_value: str | None) -> None:
             """
             Инициализирует новую операцию (VRSREQUEST/SESN Start): кладёт первую точку и обновляет props.
             extra_fields позволяет добавить специфичные поля без дублирования кода.
             """
             if op_key in active_ops:
-                return
+                save_replaced_active_op_log(
+                    op_key,
+                    active_ops[op_key],
+                    replaced_by={
+                        "event_name": event_name,
+                        "ts": ts_event,
+                        "source_file": source_path,
+                        "connect_id": connect_id,
+                    },
+                )
+                early_call.pop(op_key, None)
+                active_ops.pop(op_key, None)
             active_ops[op_key] = {
+                "db_name": db_name_value or "",
                 "session": session_value,
                 "connect": connect_value,
                 "ts_vrsrequest": ts_event,
@@ -642,86 +990,97 @@ def process_logs(input_dir: str) -> None:
             }
             update_op_props(active_ops[op_key], props)
 
-        props = extract_props(event_text)
+        props: dict = {}
+
+        def ensure_props(keys: set[str] | tuple[str, ...] | frozenset[str], include_context: bool = False) -> None:
+            nonlocal props
+            props = extract_props(
+                event_text,
+                needed_keys=keys,
+                include_context=include_context,
+                base_props=props,
+            )
+
+        route_keys = ROUTE_KEYS_SESN if event_name == "SESN" else ROUTE_KEYS_DEFAULT
+        ensure_props(route_keys, include_context=False)
+
         client_id = props.get("t:clientID")
-        session_id = props.get("SessionID")
+        session_id = normalize_session_id(props.get("SessionID"))
         connect_id = props.get("t:connectID")
-                  
+        db_name = normalize_db_name(resolve_db_name(event_name, props))
+        process_id = process_id_cache.get(source_path)
+        if process_id is None:
+            process_id = get_process_id(source_path)
+            process_id_cache[source_path] = process_id
+
         if event_name == "VRSREQUEST":
-            if client_id in pending_ops:
-                del pending_ops[client_id]
-            start_operation(client_id, session_id, connect_id)
+            client_key = build_op_key(db_name, client_id, process_id, "vrs")
+            pending_call.pop(client_key, None)
+            if client_key:
+                start_operation(client_key, session_id, connect_id, db_name)
 
         elif event_name == "VRSRESPONSE":
-            if client_id in active_ops:
-                complete_operation(client_id)
+            client_key = build_op_key(db_name, client_id, process_id, "vrs")
+            if client_key in active_ops:
+                complete_operation(client_key)
 
         elif event_name == "CALL":
-            pending = pending_ops.get(client_id)
+            min_duration_us = MIN_OPERATION_DURATION_MS * 1000
+            if to_int_safe(event_meta.get("duration")) < min_duration_us:
+                return
+            client_key = build_op_key(db_name, client_id, process_id, "vrs")
+            sesn_key = build_op_key(db_name, session_id, process_id, "sesn")
+            pending_key, pending = get_valid_pending_for_call(client_key, sesn_key, ts_event)
             if pending:
-                session_id_val = to_int_safe(props.get("SessionID"))
-                if session_id_val == 0:
-                    session_id_val = to_int_safe(pending.get("session_id"))
-                batch_calls.append({
-                    "event_name": event_name,
-                    "duration_us": to_int_safe(event_meta.get("duration")),
-                    "session_id": session_id_val,
-                    "client_id": to_int_safe(props.get("t:clientID")),
-                    "cpu_time": extract_metric_value(event_text, "CpuTime"),
-                    "memory": extract_metric_value(event_text, "Memory"),
-                    "memory_peak": extract_metric_value(event_text, "MemoryPeak"),
-                    "connect_id": to_int_safe(pending.get("connect_id")),
-                    "ts_vrsrequest_us": pending.get("ts_vrsrequest_us"),
-                    "ts_vrsresponse_us": pending.get("ts_vrsresponse_us"),
-                })
-                batch_events.append({
-                    "session_id": session_id_val,
-                    "connect_id": to_int_safe(pending.get("connect_id")),
-                    "client_id": to_int_safe(props.get("t:clientID")),
-                    "user": props.get("Usr"),
-                    "ts_vrsrequest_us": pending.get("ts_vrsrequest_us"),
-                    "ts_vrsresponse_us": pending.get("ts_vrsresponse_us"),
-                    "ts_event_us": ts_event.isoformat(timespec="microseconds"),
-                    "ts_event": ts_event.replace(microsecond=0).isoformat(),
-                    "event_name": event_name,
-                    "duration_us": to_int_safe(event_meta.get("duration")),
-                    "space_us": 0,
-                    "event_string": event_text,
-                    "context": props.get("Context"),
-                })
-                del pending_ops[client_id]
+                ensure_props(PERSIST_KEYS, include_context=True)
+                append_call_rows(pending, event_meta, event_text, props, ts_event)
+                if pending_key:
+                    pending_call.pop(pending_key, None)
+            else:
+                active_key: OpKey | None = None
+                if client_key in active_ops:
+                    active_key = client_key
+                elif sesn_key in active_ops:
+                    active_key = sesn_key
+                if active_key:
+                    if active_key not in early_call:
+                        ensure_props(PERSIST_KEYS, include_context=True)
+                        early_call[active_key] = {
+                            "meta": event_meta,
+                            "props": props,
+                            "text": event_text,
+                            "ts": ts_event,
+                        }
 
         elif event_name == "SESN":
            
             func = props.get("Func")
             appl = props.get("Appl")
             session_id = props.get("Nmb")
+            session_key = build_op_key(db_name, session_id, process_id, "sesn")
 
-            if func == "Start" and appl == "BackgroundJob":
-                start_operation(session_id, session_id, connect_id)
+            if func in ("Start", "Restore") and appl == "BackgroundJob" and session_key:
+                pending_call.pop(session_key, None)
+                start_operation(session_key, session_id, connect_id, db_name)
 
-            elif func == "Finish" and session_id in active_ops: 
-                complete_operation(session_id)
+            elif func == "Finish" and session_key in active_ops: 
+                complete_operation(session_key)
 
         else:
-            if client_id in active_ops:
-                op = active_ops[client_id]
-            elif session_id in active_ops:
-                op = active_ops[session_id]
+            client_key = build_op_key(db_name, client_id, process_id, "vrs")
+            session_key = build_op_key(db_name, session_id, process_id, "sesn")
+            if client_key in active_ops:
+                op = active_ops[client_key]
+            elif session_key in active_ops:
+                op = active_ops[session_key]
             else:
                 return            
+            ensure_props(PERSIST_KEYS, include_context=True)
             update_op_props(op, props)
             op["events"].append({"meta": event_meta, "props": props, "text": event_text, "ts": ts_event})
 
         if len(batch_events) >= BATCH_SIZE:
-            insert_batch(TABLE_OPERATIONS, batch_ops)
-            insert_batch(TABLE_EVENTS, batch_events)
-            insert_batch(TABLE_EVENT_STATS, batch_event_stats)
-            insert_batch(TABLE_CALL_OPS, batch_calls)
-            batch_events.clear()
-            batch_ops.clear()
-            batch_event_stats.clear()
-            batch_calls.clear()
+            flush_batches()
 
     total_hours = len(by_hour)
     for hour_idx, (hour_key, hour_files) in enumerate(sorted(by_hour.items()), start=1):
@@ -729,18 +1088,27 @@ def process_logs(input_dir: str) -> None:
         logger.info(f"Начало обработки часа {hour_key}: {len(hour_files)} файлов")
 
         # Прогресс-бар по строкам всех файлов часа
-        total_lines_hour = sum(get_file_line_count(fp) for fp in hour_files)
+        total_lines_hour = None
+        if COUNT_LINES_FOR_PROGRESS:
+            total_lines_hour = sum(get_file_line_count(fp) for fp in hour_files)
         with tqdm(
-            total=total_lines_hour if total_lines_hour > 0 else None,
+            total=total_lines_hour if (total_lines_hour is not None and total_lines_hour > 0) else None,
             desc=f"Час {hour_idx}/{total_hours}",
             unit="строк",
             unit_scale=True
         ) as pbar:
             lines_since_update = 0
-            for ts_event, event_meta, event_text, _ in iter_read_events(hour_files):
+            reader = iter_read_events(hour_files)
+            while True:
+                try:
+                    ts_event, event_meta, event_text, source_path = next(reader)
+                except StopIteration:
+                    break
+
                 if not event_meta:
                     continue
-                handle_event(event_meta, event_text, ts_event)
+
+                handle_event(event_meta, event_text, ts_event, source_path)
 
                 # обновляем прогресс каждые 10k прочитанных строк
                 lines_in_event = max(1, event_text.count("\n"))
@@ -750,24 +1118,35 @@ def process_logs(input_dir: str) -> None:
                     pbar.set_postfix({"Операции": total_operations})
                     lines_since_update = 0
 
+
             if lines_since_update:
                 pbar.update(lines_since_update)
                 pbar.set_postfix({"Операции": total_operations})
 
-    if batch_events or batch_ops or batch_event_stats or batch_calls:
-        insert_batch(TABLE_EVENTS, batch_events)
-        insert_batch(TABLE_OPERATIONS, batch_ops)
-        insert_batch(TABLE_EVENT_STATS, batch_event_stats)
-        insert_batch(TABLE_CALL_OPS, batch_calls)
-        logger.info(f"Отправлена финальная пачка: {len(batch_events)} событий, {len(batch_ops)} операций")
+    final_batch_events, final_batch_ops, final_batch_stats, final_batch_calls = flush_batches()
+    if any((final_batch_events, final_batch_ops, final_batch_stats, final_batch_calls)):
+        logger.info(f"Отправлена финальная пачка: {final_batch_events} событий, {final_batch_ops} операций")
+
 
     completion_msg = f"Готово: обработано {total_operations} операций"
     logger.info(completion_msg)
     print(f"[INFO] {completion_msg}")
     
-if __name__ == "__main__":
+def main() -> None:
     logger.info(f"Запуск скрипта trace-vrs. Лог сохраняется в: {log_file}")
     print(f"[INFO] Лог сохраняется в: {log_file}")
+    logger.info(
+        "Настройки: count_lines_for_progress=%s, insert_compression=%s, gzip_level=%s, json_serializer=%s",
+        COUNT_LINES_FOR_PROGRESS,
+        INSERT_COMPRESSION,
+        GZIP_LEVEL,
+        JSON_SERIALIZER_NAME,
+    )
+    print(
+        f"[INFO] Настройки: count_lines_for_progress={COUNT_LINES_FOR_PROGRESS}, "
+        f"insert_compression={INSERT_COMPRESSION}, gzip_level={GZIP_LEVEL}, "
+        f"json_serializer={JSON_SERIALIZER_NAME}"
+    )
 
     # очистим текущий dataset перед загрузкой
     clear_dataset(DATASET_NAME)
@@ -813,3 +1192,7 @@ if __name__ == "__main__":
         logger.error(f"Ошибка выполнения скрипта: {e}", exc_info=True)
         print(f"[ERROR] Ошибка: {e}")
         raise
+
+
+if __name__ == "__main__":
+    main()
