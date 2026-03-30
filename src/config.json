@@ -6,7 +6,7 @@
     "database": "tracelog"
   },
   "processing": {
-    "mode": "single",
+    "mode": "multi",
     "batch_size": 10000,
     "timeout": 30,
     "dataset_name": "rdv",
@@ -18,10 +18,16 @@
     "count_lines_for_progress": false
   },
   "filtering": {
-    "min_operation_duration_ms": 10000,
+    "min_operation_duration_ms": 1,
     "min_operation_events": 3,
     "call_expected_window_seconds": 10,
-    "call_bind_ttl_seconds": 3600
+    "call_bind_ttl_seconds": 30,
+    "context_substring": "Система.ПолучитьФорму",
+    "event_property_filters": {
+      "Usr": ["Иванова", "Петрова"],
+      "SessionID": ["123"],
+      "IB": ["test"]
+    }
   },
   "paths": {
     "input_dir": "C:\\rdv\\log-full",

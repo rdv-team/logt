@@ -1,0 +1,100 @@
+---
+description: 1C tech log record format - text and JSON, quoting, timestamps, durations, and multiline values
+globs: src/**/*.py
+alwaysApply: false
+---
+
+# Technical log record format
+
+The technical log can be written in:
+- plain text format
+- JSON object sequence format
+
+## text format in folders mode
+
+Event line shape:
+`mm:ss.microseconds-duration_us,EventName,Depth,property=value,...`
+
+Meaning:
+- `mm` - minute in current hour
+- `ss` - second in current minute
+- `microseconds` - microsecond part
+- `duration_us` - event duration in microseconds
+- `EventName` - event type
+- `Depth` - nesting depth in current thread
+- then properties
+
+## text format in plain mode
+
+The beginning changes to full datetime:
+`YYYY-MM-DDTHH:MM:SS.microseconds-duration_us,...`
+
+## JSON format
+
+JSON records include named fields:
+- `ts`
+- `duration`
+- `name`
+- `depth`
+- plus event properties
+
+## quoting and separators
+
+Property pairs are comma-separated.
+
+However:
+- property values may contain commas
+- property values may contain line breaks
+- such values are quoted using quotes or apostrophes
+- quote characters inside values may be doubled
+
+Therefore:
+- NEVER parse a record using naive `split(',')`
+- ALWAYS use a stateful parser that respects quotes and multiline values
+
+# Quoted values with doubled quotes examples
+
+23:45.123456-1500,EXCP,2,Descr="Error: value ""Not found"" is invalid"
+
+23:45.123456-1500,EXCP,2,Descr='Error: value ''Not found'' is invalid'
+
+23:45.123456-1500,CALL,3,Context="Call ""Object.Method()"" finished"
+
+23:45.123456-1500,CALL,3,Context="Method ""Process(1,2,3)"" executed",Usr=Ivanov
+
+23:45.123456-1500,EXCP,2,Descr="Error: ""Method(Param1, Param2)"" returned ""NULL"""
+
+23:45.123456-1500,EXCP,2,Descr="Error:
+value ""Not found""
+at line 5"
+
+23:45.123456-1500,CALL,3,Context="Executing ""Calculate(10,20)""",CpuTime=1200,Memory=2048
+
+23:45.123456-1500,CALL,3,Context='Executing ''Calculate(10,20)''',CpuTime=1200,Memory=2048
+
+23:45.123456-1500,EXCP,2,Descr="Unexpected token "","" in expression"
+
+23:45.123456-1500,EXCP,2,Descr='Unexpected token '','' in expression'
+
+## multiline behavior
+
+A logical event may span multiple physical lines in text logs because property values can contain line breaks.
+
+Parser requirements:
+- support multiline property values
+- continue reading until record structure is complete
+- do not assume one physical line equals one logical event
+
+## timestamps
+
+In text logs under `folders` placement:
+- event line itself contains only minute/second/microseconds within an hour
+- full hour context comes from filename timestamp
+
+In `plain` mode and JSON:
+- full timestamp is directly present in the record
+
+## duration
+
+Duration is in microseconds in the record format used by modern technical logs.
+Do not reinterpret duration units without explicit version-based evidence.

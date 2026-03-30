@@ -1,0 +1,94 @@
+---
+description: Core 1C technical log event catalog for operation reconstruction and performance analysis
+globs: src/**/*.py
+alwaysApply: false
+---
+
+# Core events for LogT and tech-log parsing
+
+This project focuses on the subset of events most relevant to:
+- reconstructing user operations
+- reconstructing background operations
+- analyzing latency
+- diagnosing DB waits, locks, errors, and context
+
+## operation boundary events
+
+`VRSREQUEST`
+- request to server for a resource
+- natural start boundary for client-server operation reconstruction
+
+`VRSRESPONSE`
+- server response
+- natural end boundary for client-server operation reconstruction
+
+`SESN`
+- session-related actions
+- used for session lifecycle and background job reconstruction
+- `Func=Start`, `Func=Restore`, `Func=Finish`, `Func=Wait`, `Func=Attach`, etc.
+
+## code execution / remote call events
+
+`CALL`
+- incoming remote call on the receiver side
+- contains important context and runtime metrics
+
+`SCALL`
+- outgoing remote call on the source side
+
+## DB and query events
+
+`DBMSSQL`
+`DBPOSTGRS`
+- DB-level SQL execution
+
+`SDBL`
+- query/model database layer activity
+
+## locking and concurrency
+
+`TLOCK`
+- managed transaction locks
+
+`TTIMEOUT`
+- lock wait timeout
+
+`TDEADLOCK`
+- deadlock detected
+
+## errors and crashes
+
+`EXCP`
+- exception / severe error event
+
+`EXCPCNTX`
+- exception context, unfinished events at crash/error time
+
+## infra / cluster / connection
+
+`CLSTR`
+- cluster operations and cluster state changes
+
+`CONN`
+- connection establish / break and ping-related connection diagnostics
+
+`PROC`
+- process lifecycle and process-level events
+
+## memory / diagnostics
+
+`MEM`
+- memory growth diagnostics if enabled
+
+`LEAKS`
+- leak diagnostics if enabled
+
+## event handling guidance
+
+Do not assume all events are present in every environment.
+Presence depends on `logcfg.xml` and enabled platform mechanisms.
+
+For LogT:
+- `VRSREQUEST`, `VRSRESPONSE`, `SESN`, `CALL` are the most important correlation events
+- DB and lock events are supporting evidence inside the reconstructed operation
+- `EXCP`, `TTIMEOUT`, `TDEADLOCK` are high-value diagnostics inside the operation timeline

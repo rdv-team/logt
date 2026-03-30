@@ -91,6 +91,39 @@ if CALL_BIND_TTL_SECONDS < 1:
 if CALL_BIND_TTL_SECONDS < CALL_EXPECTED_WINDOW_SECONDS:
     CALL_BIND_TTL_SECONDS = CALL_EXPECTED_WINDOW_SECONDS
 
+def _sanitize_event_property_filters(raw_filters: object) -> dict[str, list[str]]:
+    """Очищает фильтры из config.json от служебных пустых значений."""
+    if not isinstance(raw_filters, dict):
+        return {}
+
+    cleaned: dict[str, list[str]] = {}
+    for prop, values in raw_filters.items():
+        if not isinstance(prop, str) or not isinstance(values, list):
+            continue
+
+        out_values: list[str] = []
+        for value in values:
+            # Пустые маркеры игнорируются для всех фильтров.
+            if value is None or value == "":
+                continue
+            # Для SessionID 0/"0" трактуем как "фильтр отключён".
+            if prop == "SessionID" and (value == 0 or value == "0"):
+                continue
+            if isinstance(value, str):
+                out_values.append(value)
+
+        if out_values:
+            cleaned[prop] = out_values
+
+    return cleaned
+
+EVENT_PROPERTY_FILTERS: dict[str, list[str]] = _sanitize_event_property_filters(
+    config["filtering"].get("event_property_filters", {})
+)
+# Предвычисленные нормализованные множества для быстрого сравнения в hot-path
+_FILTER_NORM_SETS: dict[str, frozenset[str]] = {}
+# Подстрока для фильтрации по полю Context всех событий операции; пустая строка — фильтр отключён
+CONTEXT_FILTER_SUBSTRING: str = config["filtering"].get("context_substring", "")
 
 # Reuse HTTP connection
 SESSION = requests.Session()
@@ -105,11 +138,12 @@ TABLE_CALL_OPS = "calls"
 EVENT_START_RE = re.compile(r"^(\d{2}):(\d{2})\.(\d{6})-(\d+),([A-Za-z]+),")
 CONTEXT_PATTERN = re.compile(r',Context=(?:"([^"]*)"|\'([^\']*)\'|([^,\r\n]+))', re.DOTALL)
 SESSION_ID_RE = re.compile(r"^\s*(\d+)(?:\(\d+\))?\s*$")
-PROP_KEYS = ("t:clientID", "SessionID", "Usr", "t:connectID", "Appl", "Func", "Nmb", "IB", "p:processName")
+PROP_KEYS = ("t:clientID", "SessionID", "Usr", "t:connectID", "Appl", "Func", "Nmb", "IB", "p:processName", "Module", "Method", "Form")
 PROP_KEY_TOKENS = {key: f"{key}=" for key in PROP_KEYS}
 ROUTE_KEYS_DEFAULT = frozenset({"t:clientID", "SessionID", "t:connectID", "p:processName"})
 ROUTE_KEYS_SESN = frozenset({"Nmb", "Func", "Appl", "t:connectID", "IB", "SessionID"})
 PERSIST_KEYS = frozenset({"Usr"})
+CALL_KEYS = frozenset({"Usr", "Module", "Method", "Func", "Form"})
 
 
 # ============================================================
@@ -273,6 +307,14 @@ def normalize_session_id(session_id: str | None) -> str | None:
         return session_id
     match = SESSION_ID_RE.match(session_id)
     return match.group(1) if match else None
+
+for _prop, _vals in EVENT_PROPERTY_FILTERS.items():
+    if _prop == "IB":
+        _FILTER_NORM_SETS[_prop] = frozenset(normalize_db_name(v) or "" for v in _vals)
+    elif _prop == "SessionID":
+        _FILTER_NORM_SETS[_prop] = frozenset(normalize_session_id(v) or v for v in _vals)
+    else:
+        _FILTER_NORM_SETS[_prop] = frozenset(_vals)
 
 def update_op_props(op: dict, props: dict) -> None:
     """Обновляет session в active_ops, если они ещё не заданы."""
@@ -684,6 +726,94 @@ def build_temp_for_multi(input_dir: str, temp_dir: str) -> None:
 
 
 # ============================================================
+# =  CALL CONTEXT HELPERS
+# ============================================================
+
+def _compute_call_context(call_props: dict) -> str | None:
+    """Вычисляет контекст CALL: Context → Module.Method → Func: Form → Func."""
+    context = call_props.get("Context")
+    if not context:
+        module = call_props.get("Module")
+        method = call_props.get("Method")
+        if module and method:
+            context = f"Фоновое задание: {module}.{method}"
+        elif module:
+            context = module
+        else:
+            func = call_props.get("Func")
+            if func:
+                form = call_props.get("Form")
+                context = f"{func}: {form}" if form else func
+    return context
+
+
+# ============================================================
+# =  OPERATION FILTERS
+# ============================================================
+
+def _passes_property_filters(available: dict[str, str | None]) -> bool:
+    """
+    Проверяет доступные свойства против EVENT_PROPERTY_FILTERS.
+    Ключи, отсутствующие в available, пропускаются — значение ещё неизвестно.
+    Ключ с None-значением: свойство требуется фильтром, но не найдено → False.
+    """
+    for prop in EVENT_PROPERTY_FILTERS:
+        if prop not in available:
+            continue
+        value = available[prop]
+        if value is None:
+            return False
+        if prop == "IB":
+            norm_value = normalize_db_name(value) or ""
+        elif prop == "SessionID":
+            norm_value = normalize_session_id(value) or value
+        else:
+            norm_value = value
+        if norm_value not in _FILTER_NORM_SETS[prop]:
+            return False
+    return True
+
+
+def _passes_early_filters(db_name: str | None) -> bool:
+    """Быстрая проверка до создания операции — только свойства, известные на старте."""
+    if not EVENT_PROPERTY_FILTERS:
+        return True
+    available: dict[str, str | None] = {}
+    if "IB" in EVENT_PROPERTY_FILTERS:
+        available["IB"] = db_name
+    return _passes_property_filters(available)
+
+
+def _passes_operation_filters(op: dict) -> bool:
+    """Фильтры длительности, числа событий и всех свойств операции."""
+    if op.get("duration_us", 0) < MIN_OPERATION_DURATION_MS * 1000:
+        return False
+    if len(op["events"]) < MIN_OPERATION_EVENTS:
+        return False
+    if EVENT_PROPERTY_FILTERS:
+        available: dict[str, str | None] = {
+            "IB": op.get("db_name"),
+            "SessionID": op.get("session"),
+            "Usr": op.get("user"),
+        }
+        if not _passes_property_filters(available):
+            return False
+
+    if CONTEXT_FILTER_SUBSTRING:
+        needle = CONTEXT_FILTER_SUBSTRING
+        for event in op["events"]:
+            props = event.get("props")
+            if props:
+                ctx = props.get("Context")
+                if ctx and needle in ctx:
+                    break
+        else:
+            return False
+
+    return True
+
+
+# ============================================================
 # =  MAIN LOG PARSER
 # ============================================================
 
@@ -708,11 +838,18 @@ def process_logs(input_dir: str) -> None:
     active_ops: Dict[OpKey, Dict] = {}
     pending_call: Dict[OpKey, Dict] = {}
     early_call: Dict[OpKey, Dict] = {}
+    pending_op: Dict[OpKey, Dict] = {}
     process_id_cache: dict[str, str] = {}
     batch_ops, batch_events, batch_event_stats, batch_calls = [], [], [], []
     total_operations = 0
     db_ids: Dict[str, int] = {}
     next_db_id = 1
+
+    def flush_pending_op(op_key: OpKey) -> None:
+        """Переносит отложенный op_row в batch_ops (fallback-контекст уже установлен)."""
+        op_row = pending_op.pop(op_key, None)
+        if op_row is not None:
+            batch_ops.append(op_row)
 
     def flush_batches() -> tuple[int, int, int, int]:
         counts = (len(batch_events), len(batch_ops), len(batch_event_stats), len(batch_calls))
@@ -765,6 +902,16 @@ def process_logs(input_dir: str) -> None:
                 session_id_val = to_int_safe(pending.get("session_id"))
             client_id_val = to_int_safe(pending.get("client_id"))
 
+            context = _compute_call_context(call_props)
+
+            # Переносим отложенный op_row из pending_op в batch_ops, фиксируем context_call
+            call_op_key = pending.get("op_key")
+            if call_op_key is not None:
+                op_row = pending_op.pop(call_op_key, None)
+                if op_row is not None:
+                    op_row["context_call"] = context
+                    batch_ops.append(op_row)
+
             batch_calls.append({
                 "dataset": DATASET_NAME,
                 "db_name": pending.get("db_name") or "",
@@ -794,7 +941,7 @@ def process_logs(input_dir: str) -> None:
                 "duration_us": to_int_safe(call_meta.get("duration")),
                 "space_us": 0,
                 "event_string": call_text,
-                "context": call_props.get("Context"),
+                "context": context,
             })
 
         def get_valid_pending_for_call(client_key: OpKey | None, sesn_key: OpKey | None, call_ts: datetime) -> tuple[OpKey | None, dict | None]:
@@ -814,11 +961,13 @@ def process_logs(input_dir: str) -> None:
 
                 if not isinstance(response_ts, datetime):
                     pending_call.pop(candidate_key, None)
+                    flush_pending_op(candidate_key)
                     continue
 
                 gap_sec = abs((call_ts - response_ts).total_seconds())
                 if gap_sec > CALL_BIND_TTL_SECONDS:
                     pending_call.pop(candidate_key, None)
+                    flush_pending_op(candidate_key)
                     logger.warning(
                         "Dropped stale pending CALL bind: key=%s, gap=%.3fs, ttl=%ss",
                         candidate_key,
@@ -851,33 +1000,39 @@ def process_logs(input_dir: str) -> None:
             delta = op["ts_vrsresponse"] - op["ts_vrsrequest"]
             op["duration_us"] = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
-            duration_us = op.get("duration_us", 0)
-            events_count = len(op["events"])
-            min_duration_us = MIN_OPERATION_DURATION_MS * 1000
-            if duration_us < min_duration_us or events_count < MIN_OPERATION_EVENTS:
-                early_call.pop(op_key, None)
-                del active_ops[op_key]
-                return
-
             early_item = early_call.pop(op_key, None)
 
             if op.get("session"):
+
+                op["user"]         = extract_first_field(op["events"], "Usr")
+                #op["context"]      = extract_first_field(op["events"], "Context")
+                op["context_call"] = _compute_call_context(early_item["props"]) if early_item else None
+
+                if not _passes_operation_filters(op):
+                    del active_ops[op_key]
+                    return
+
                 total_operations += 1
 
-                batch_ops.append({
+                op_row = {
                     "dataset": DATASET_NAME,
                     "db_name": op.get("db_name") or "",
                     "session_id": to_int_safe(op.get("session")),
                     "connect_id": to_int_safe(op.get("connect")),
                     "client_id": to_int_safe(op.get("client")),
-                    "user": extract_first_field(op["events"], "Usr"),
+                    "user": op.get("user"),
                     "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
                     "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
                     "ts_vrsrequest": op["ts_vrsrequest"].replace(microsecond=0).isoformat(),
                     "ts_vrsresponse": op["ts_vrsresponse"].replace(microsecond=0).isoformat(),
                     "duration_us": to_int_safe(op.get("duration_us", 0)),
-                    "context": extract_first_field(op["events"], "Context"),
-                })
+                    "context": op.get("context_call")
+                }
+
+                if early_item:
+                    batch_ops.append(op_row)   # контекст уже финальный
+                else:
+                    pending_op[op_key] = op_row  # ждёт CALL-контекст
 
                 if event_name in ("VRSRESPONSE", "SESN") and op_key:
                     pending_call[op_key] = {
@@ -888,6 +1043,7 @@ def process_logs(input_dir: str) -> None:
                         "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
                         "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
                         "ts_vrsresponse_dt": op["ts_vrsresponse"],
+                        "op_key": op_key,
                     }
                     if early_item:
                         pending = pending_call[op_key]
@@ -1016,7 +1172,8 @@ def process_logs(input_dir: str) -> None:
         if event_name == "VRSREQUEST":
             client_key = build_op_key(db_name, client_id, process_id, "vrs")
             pending_call.pop(client_key, None)
-            if client_key:
+            flush_pending_op(client_key)
+            if client_key and _passes_early_filters(db_name):
                 start_operation(client_key, session_id, connect_id, db_name)
 
         elif event_name == "VRSRESPONSE":
@@ -1032,7 +1189,7 @@ def process_logs(input_dir: str) -> None:
             sesn_key = build_op_key(db_name, session_id, process_id, "sesn")
             pending_key, pending = get_valid_pending_for_call(client_key, sesn_key, ts_event)
             if pending:
-                ensure_props(PERSIST_KEYS, include_context=True)
+                ensure_props(CALL_KEYS, include_context=True)
                 append_call_rows(pending, event_meta, event_text, props, ts_event)
                 if pending_key:
                     pending_call.pop(pending_key, None)
@@ -1044,7 +1201,7 @@ def process_logs(input_dir: str) -> None:
                     active_key = sesn_key
                 if active_key:
                     if active_key not in early_call:
-                        ensure_props(PERSIST_KEYS, include_context=True)
+                        ensure_props(CALL_KEYS, include_context=True)
                         early_call[active_key] = {
                             "meta": event_meta,
                             "props": props,
@@ -1061,7 +1218,9 @@ def process_logs(input_dir: str) -> None:
 
             if func in ("Start", "Restore") and appl == "BackgroundJob" and session_key:
                 pending_call.pop(session_key, None)
-                start_operation(session_key, session_id, connect_id, db_name)
+                flush_pending_op(session_key)
+                if _passes_early_filters(db_name):
+                    start_operation(session_key, session_id, connect_id, db_name)
 
             elif func == "Finish" and session_key in active_ops: 
                 complete_operation(session_key)
@@ -1122,6 +1281,9 @@ def process_logs(input_dir: str) -> None:
             if lines_since_update:
                 pbar.update(lines_since_update)
                 pbar.set_postfix({"Операции": total_operations})
+
+    for _op_key in list(pending_op):
+        flush_pending_op(_op_key)
 
     final_batch_events, final_batch_ops, final_batch_stats, final_batch_calls = flush_batches()
     if any((final_batch_events, final_batch_ops, final_batch_stats, final_batch_calls)):
